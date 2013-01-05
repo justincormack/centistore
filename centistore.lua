@@ -57,8 +57,8 @@ end
 
 local function submit(t, k, buf, cmd, f, data)
   if #t.avail == 0 then return false end
-  local offset = t.block * bl(t, k)
   local slot = table.remove(t.avail)
+  local offset = t.block * bl(t, k)
   if not buf then buf = t.buf[slot] end
   t.info[slot] = {opcode = cmd, buf = buf, f = f, data = data}
   t.iocb[slot] = {opcode = cmd, data = slot, fildes = t.fd, buf = buf, nbytes = t.block, offset = offset, resfd = t.efd}
@@ -156,7 +156,9 @@ function cent.init(param)
       retr = retr,
       nnv = nnv,
       cast = function(t, b) return ffi.cast(nvp, b) end,
-      copy = function(t, a, b) ffi.copy(a, b, b.n + ffi.offsetof(nv, "v")) end
+      copy = function(t, a, b) ffi.copy(a, b, b.n + ffi.offsetof(nv, "v")) end,
+      full = function(t) return #t.avail == 0 end,
+      time = function(t) return S.gettimeofday().time end
     }})
 end
 
