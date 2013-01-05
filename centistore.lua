@@ -8,8 +8,6 @@ local function assert(cond, s)
   return oldassert(cond, tostring(s))
 end
 
-local t = S.t
-
 local ffi = require "ffi"
 
 local murmer = ffi.load("murmer.so.1")
@@ -57,46 +55,41 @@ local function bl(t, k)
   return hash % t.blocks
 end
 
-local function set(t, k, v)
-  if type(v) == "string" then v = nnv(t, v, #v, t.buf) end
-  local n = v.n
+local function submit(t, k, buf, cmd, f, data)
+  if #t.avail == 0 then return false end
   local offset = t.block * bl(t, k)
-  --local ret = assert(S.pwrite(t.fd, v, t.block, offset))
-  --assert(ret == t.block, "no short write: ")
-  local ret = assert(S.io_submit(t.ctx, {{cmd = "pwrite", data = 0, fd = t.fd, buf = S.pt.void(v), nbytes = t.block, offset = offset, resfd = t.efd}}))
+  local slot = table.remove(t.avail)
+  if not buf then buf = t.buf[slot] end
+  t.info[slot] = {opcode = cmd, buf = buf, f = f, data = data}
+  t.iocb[slot] = {opcode = cmd, data = slot, fildes = t.fd, buf = buf, nbytes = t.block, offset = offset, resfd = t.efd}
+  local a = S.t.iocb_array{t.iocb[slot]} -- this allocates ptr, could pass one in
+  local ret = assert(S.io_submit(t.ctx, a))
   assert(ret == 1)
-  local r = assert(t.epfd:epoll_wait()) -- blocking as default timeout is -1
-  assert(#r == 1)
-  assert(r[1].fd == t.efd:getfd(), "expect to get fd of eventfd file back")
-  local e = util.eventfd_read(t.efd)
-  assert(e == 1, "expect to be told one aio event ready")
-  local r = assert(S.io_getevents(t.ctx, e, e))
-  assert(#r == 1, "expect one aio event")
-  assert(r[1].data == 0, "expect to get data back")
-  assert(r[1].res == t.block, "expect full write")
+  return true
 end
 
-local function get(t, k, v)
-  local offset = t.block * bl(t, k)
-  --local ret = assert(S.pread(t.fd, t.buf, t.block, offset))
-  --assert(ret == t.block, "no short read")
-  -- TODO don't allocate iocb all the time. note must not be modified, so allocate set of them
-  -- TODO data will store queue point
-  local ret = assert(S.io_submit(t.ctx, {{cmd = "pread", data = 0, fd = t.fd, buf = t.buf, nbytes = t.block, offset = offset, resfd = t.efd}}))
-  assert(ret == 1)
+local function set(t, k, v, f, data)
+  return submit(t, k, v, "pwrite", f, data)
+end
+
+local function get(t, k, f, data)
+  return submit(t, k, nil, "pread", f, data)
+end
+
+local function retr(t, v)
   local r = assert(t.epfd:epoll_wait()) -- blocking as default timeout is -1
   assert(#r == 1)
   assert(r[1].fd == t.efd:getfd(), "expect to get fd of eventfd file back")
   local e = util.eventfd_read(t.efd)
-  assert(e == 1, "expect to be told one aio event ready")
   local r = assert(S.io_getevents(t.ctx, e, e))
-  assert(#r == 1, "expect one aio event")
-  assert(r[1].data == 0, "expect to get data back")
-  assert(r[1].res == t.block, "expect full read")
-  local vv = ffi.cast(nvp, t.buf)[0]
-  local v = v or nv(vv.n)
-  ffi.copy(v, vv, vv.n + 4)
-  return v
+  
+  for i = 1, #r do
+    assert(tonumber(r[i].res) == t.block, "expect full read/write got " .. tonumber(r[i].res))
+    local slot = tonumber(r[i].data)
+    local info = t.info[slot]
+    if info.f then info.f(info.data, info.buf, info, r[i]) end
+    t.avail[#t.avail + 1] = slot
+  end
 end
 
 function cent.init(param)
@@ -112,7 +105,11 @@ function cent.init(param)
   local blocks = param.blocks or 4096 -- must be multiple of 512 for direct io
   local size = blocks * block
   local queue = param.queue or 32
-  local buf = assert(S.mmap(nil, block * queue, "read, write", "private, anonymous", -1, 0))
+
+  local buf = {}
+  for i = 0, queue - 1 do 
+    buf[i] = assert(S.mmap(nil, block, "read, write", "private, anonymous", -1, 0))
+  end
 
   if inet6 and not addr then addr = "::1" end
   if not inet6 and not addr then addr = "127.0.0.1" end
@@ -126,8 +123,8 @@ function cent.init(param)
 
   local ok = assert(S.fadvise(fd, "random"))
 
-  local family, sa = "inet", t.sockaddr_in
-  if inet6 then family, sa = "inet6", t.sockaddr_in6 end
+  local family, sa = "inet", S.t.sockaddr_in
+  if inet6 then family, sa = "inet6", S.t.sockaddr_in6 end
   local socktype = "dgram"
   if tcp then socktype = "stream" end
 
@@ -145,12 +142,21 @@ function cent.init(param)
   local epfd = assert(S.epoll_create())
   assert(epfd:epoll_ctl("add", efd, "in"))
 
-  return setmetatable({fd = fd, block = block, blocks = blocks, sock = sock,
-    buf = buf, queue = queue, ctx = ctx, efd = efd, epfd = epfd, q0 = 0, q1 = 0},
+  local avail, iocb = {}, {}
+  for i = 0, queue - 1 do
+    avail[#avail + 1] = i
+    iocb[#iocb + 1] = S.t.iocb()
+  end
+
+  return setmetatable({fd = fd, block = block, blocks = blocks, sock = sock, iocb = iocb,
+    buf = buf, queue = queue, ctx = ctx, efd = efd, epfd = epfd, avail = avail, info = {}},
     {__index = {
       set = set,
       get = get,
-      nnv = nnv
+      retr = retr,
+      nnv = nnv,
+      cast = function(t, b) return ffi.cast(nvp, b) end,
+      copy = function(t, a, b) ffi.copy(a, b, b.n + ffi.offsetof(nv, "v")) end
     }})
 end
 
